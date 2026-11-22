@@ -105,34 +105,43 @@ class TimelineRepository extends DatabaseAccessor<Drift> with $TimelineRepositor
   );
 
   Stream<List<Bucket>> _watchLocalAlbumBucket(String albumId, {GroupAssetsBy groupBy = GroupAssetsBy.day}) {
+    final Stream<List<Bucket>> bucketStream;
     if (groupBy == GroupAssetsBy.none) {
-      return _db.localAlbumAssetEntity
+      bucketStream = _db.localAlbumAssetEntity
           .count(where: (row) => row.albumId.equals(albumId))
           .map(_generateBuckets)
           .watchSingle();
+    } else {
+      final assetCountExp = _db.localAssetEntity.id.count();
+      final dateExp = _db.localAssetEntity.createdAt.dateFmt(groupBy, toLocal: true);
+
+      final query =
+          _db.localAssetEntity.selectOnly().join([
+              innerJoin(
+                _db.localAlbumAssetEntity,
+                _db.localAlbumAssetEntity.assetId.equalsExp(_db.localAssetEntity.id),
+                useColumns: false,
+              ),
+            ])
+            ..addColumns([assetCountExp, dateExp])
+            ..where(_db.localAlbumAssetEntity.albumId.equals(albumId))
+            ..groupBy([dateExp])
+            ..orderBy([OrderingTerm.desc(dateExp)]);
+
+      bucketStream = query.map((row) {
+        final timeline = row.read(dateExp)!.truncateDate(groupBy);
+        final assetCount = row.read(assetCountExp)!;
+        return TimeBucket(date: timeline, assetCount: assetCount);
+      }).watch();
     }
 
-    final assetCountExp = _db.localAssetEntity.id.count();
-    final dateExp = _db.localAssetEntity.createdAt.dateFmt(groupBy, toLocal: true);
-
-    final query =
-        _db.localAssetEntity.selectOnly().join([
-            innerJoin(
-              _db.localAlbumAssetEntity,
-              _db.localAlbumAssetEntity.assetId.equalsExp(_db.localAssetEntity.id),
-              useColumns: false,
-            ),
-          ])
-          ..addColumns([assetCountExp, dateExp])
-          ..where(_db.localAlbumAssetEntity.albumId.equals(albumId))
-          ..groupBy([dateExp])
-          ..orderBy([OrderingTerm.desc(dateExp)]);
-
-    return query.map((row) {
-      final timeline = row.read(dateExp)!.truncateDate(groupBy);
-      final assetCount = row.read(assetCountExp)!;
-      return TimeBucket(date: timeline, assetCount: assetCount);
-    }).watch();
+    // _getLocalAlbumBucketAssets joins remoteAssetEntity to populate remoteId (cloud_off vs cloud_done).
+    // Re-emit buckets whenever remoteAssetEntity changes so TimelineService reloads the buffer
+    // and updates tile backup status icons immediately after uploads/deletes.
+    return bucketStream.switchMap(
+      (buckets) =>
+          _db.tableUpdates(TableUpdateQuery.onTable(_db.remoteAssetEntity)).map((_) => buckets).startWith(buckets),
+    );
   }
 
   Future<List<BaseAsset>> _getLocalAlbumBucketAssets(String albumId, {required int offset, required int count}) {

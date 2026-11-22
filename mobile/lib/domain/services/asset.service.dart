@@ -38,8 +38,10 @@ class AssetService {
   }
 
   Stream<BaseAsset?> watchAsset(BaseAsset asset) {
-    final id = asset is LocalAsset ? asset.id : (asset as RemoteAsset).id;
-    return asset is LocalAsset ? _localRepository.watch(id) : _remoteRepository.watch(id);
+    return switch (asset) {
+      LocalAsset() => _remoteRepository.watchMergedAsset(localId: asset.localId, checksum: asset.checksum),
+      RemoteAsset() => _remoteRepository.watchMergedAsset(remoteId: asset.remoteId, checksum: asset.checksum),
+    };
   }
 
   Future<List<LocalAsset?>> getLocalAssetsByChecksum(String checksum) {
@@ -198,6 +200,10 @@ class AssetService {
     return _localRepository.get(id);
   }
 
+  Future<void> updateLocalChecksum(String localId, String checksum) {
+    return _localRepository.updateHashes({localId: checksum});
+  }
+
   Future<List<Tag>> getTags(String assetId) {
     return _apiRepository.getAssetTags(assetId);
   }
@@ -214,6 +220,9 @@ class AssetService {
     } finally {
       // the upload went through even when the stack call did not, so this version is the new base
       await _localRepository.updatePreviousChecksum(localId, uploadedChecksum);
+      if (checksum == null) {
+        await _localRepository.updateHashes({localId: uploadedChecksum});
+      }
     }
   }
 }

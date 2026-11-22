@@ -1,6 +1,7 @@
 import 'package:drift/drift.dart';
 import 'package:immich_mobile/data/db/main/database.dart';
 import 'package:immich_mobile/data/db/main/table/asset/edit.dart';
+import 'package:immich_mobile/data/db/main/table/local/asset.dart';
 import 'package:immich_mobile/data/db/main/table/remote/asset.dart';
 import 'package:immich_mobile/data/db/main/table/remote/asset.drift.dart';
 import 'package:immich_mobile/data/db/main/table/remote/exif.dart';
@@ -37,8 +38,43 @@ class RemoteAssetRepository extends DatabaseAccessor<Drift> with $RemoteAssetRep
     });
   }
 
-  Stream<RemoteAsset?> watch(String id) {
-    return _assetSelectable(id).watchSingleOrNull();
+  /// Watches an asset, including transitions between local and remote representations.
+  /// Exactly one of [remoteId] or [localId] anchors the asset; [checksum] (or the
+  /// live local checksum once hashed) finds its counterpart. Prefers remote and emits
+  /// `null` when neither exists.
+  Stream<BaseAsset?> watchMergedAsset({String? remoteId, String? localId, String? checksum}) {
+    assert((localId == null) != (remoteId == null), 'exactly one of localId / remoteId must be set');
+
+    final rae = _db.remoteAssetEntity;
+    final lae = _db.localAssetEntity;
+    final currentUser = _db.authUserEntity;
+
+    final JoinedSelectStatement query;
+    if (remoteId != null) {
+      final remoteMatch = rae.id.equals(remoteId);
+      final localMatch = checksum == null ? const Constant(false) : lae.checksum.equals(checksum);
+      query = currentUser.select().join([leftOuterJoin(rae, remoteMatch), leftOuterJoin(lae, localMatch)]);
+    } else {
+      final localMatch = lae.id.equalsNullable(localId);
+      // Join local first so an unhashed local asset (checksum == null at open time)
+      // automatically promotes to remote once its checksum is written.
+      // Falling back to the initial checksum keeps watching remote if local is deleted.
+      final effectiveChecksum = checksum != null ? coalesce<String>([lae.checksum, Constant(checksum)]) : lae.checksum;
+      final remoteMatch = rae.checksum.equalsExp(effectiveChecksum) & rae.ownerId.equalsExp(currentUser.id);
+      query = currentUser.select().join([leftOuterJoin(lae, localMatch), leftOuterJoin(rae, remoteMatch)]);
+    }
+
+    query
+      ..orderBy([OrderingTerm.asc(lae.id)])
+      ..limit(1);
+
+    return query.watchSingleOrNull().map((row) {
+      final remote = row?.readTableOrNull(rae);
+      if (remote != null) {
+        return remote.toDto(localId: row?.readTableOrNull(lae)?.id);
+      }
+      return row?.readTableOrNull(lae)?.toDto();
+    });
   }
 
   Stream<Set<String>> watchDeletedAssetIds(Iterable<String> ids, AssetVisibility visibility) {

@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:crypto/crypto.dart';
 import 'package:flutter/foundation.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:immich_mobile/domain/models/asset/asset_metadata.model.dart';
@@ -256,9 +257,11 @@ class ForegroundUploadService {
     File? livePhotoFile;
 
     try {
-      final remoteId = (await _assetService.getLocalAsset(asset.id))?.remoteId;
+      final localAsset = await _assetService.getLocalAsset(asset.id);
+      var checksum = localAsset?.checksum ?? asset.checksum;
+      final remoteId = localAsset?.remoteId;
       if (remoteId != null) {
-        await _handleUploadSuccess(asset, remoteId, callbacks);
+        await _handleUploadSuccess(asset.copyWith(checksum: checksum), remoteId, callbacks);
         return;
       }
 
@@ -316,6 +319,21 @@ class ForegroundUploadService {
         _logger.warning("Failed to obtain file from iCloud for asset ${asset.id} - ${asset.name}");
         callbacks.onError?.call(asset.localId!, t.asset_not_found_on_icloud);
         return;
+      }
+
+      // Manual uploads can target assets in albums outside backup selection that were never hashed.
+      // Compute the SHA-1 checksum on the already-fetched file (avoiding a second iCloud download),
+      // persist it locally, and skip uploading if the server copy already exists in the local DB.
+      if (checksum == null) {
+        checksum = await _computeFileChecksum(file);
+        if (checksum != null) {
+          await _assetService.updateLocalChecksum(asset.id, checksum);
+          final existingRemoteId = (await _assetService.getLocalAsset(asset.id))?.remoteId;
+          if (existingRemoteId != null) {
+            await _handleUploadSuccess(asset.copyWith(checksum: checksum), existingRemoteId, callbacks);
+            return;
+          }
+        }
       }
 
       final fileName = await _assetMediaRepository.getOriginalFilename(asset.id) ?? asset.name;
@@ -390,7 +408,7 @@ class ForegroundUploadService {
       );
 
       if (result.isSuccess && result.remoteAssetId != null) {
-        await _handleUploadSuccess(asset, result.remoteAssetId!, callbacks);
+        await _handleUploadSuccess(asset.copyWith(checksum: checksum), result.remoteAssetId!, callbacks);
       } else if (result.isCancelled) {
         shouldAbortUpload = true;
       } else if (result.errorMessage != null) {
@@ -418,6 +436,16 @@ class ForegroundUploadService {
           _logger.severe(() => "ERROR deleting file: $error", stackTrace);
         }
       }
+    }
+  }
+
+  Future<String?> _computeFileChecksum(File file) async {
+    try {
+      final digest = await sha1.bind(file.openRead()).first;
+      return base64.encode(digest.bytes);
+    } catch (error) {
+      _logger.warning("Failed to compute checksum for ${file.path}: $error");
+      return null;
     }
   }
 

@@ -7,6 +7,7 @@ import 'package:immich_mobile/domain/models/asset/base_asset.model.dart';
 import 'package:immich_mobile/generated/translations.g.dart';
 import 'package:immich_mobile/presentation/actions/action.widget.dart';
 import 'package:immich_mobile/presentation/actions/upload.action.dart';
+import 'package:immich_mobile/providers/background_sync.provider.dart';
 import 'package:immich_mobile/providers/backup/asset_upload_progress.provider.dart';
 import 'package:immich_mobile/providers/infrastructure/toast.provider.dart';
 import 'package:immich_mobile/services/foreground_upload.service.dart';
@@ -21,10 +22,13 @@ import '../presentation_context.dart';
 void main() {
   late PresentationContext context;
   late MockForegroundUploadService uploadService;
+  late MockBackgroundSyncManager backgroundSync;
 
   setUp(() async {
     context = await PresentationContext.create();
     uploadService = context.service.upload;
+    backgroundSync = MockBackgroundSyncManager();
+    when(() => backgroundSync.syncRemote(enqueue: any(named: 'enqueue'))).thenAnswer((_) async => true);
   });
 
   tearDown(() async {
@@ -34,6 +38,7 @@ void main() {
   List<Override> uploadOverrides() => [
     foregroundUploadServiceProvider.overrideWithValue(uploadService),
     toastServiceProvider.overrideWithValue(context.service.toast),
+    backgroundSyncProvider.overrideWithValue(backgroundSync),
   ];
 
   Future<void> pumpUpload(WidgetTester tester, Set<BaseAsset> selection, {bool showProgress = false}) =>
@@ -91,6 +96,7 @@ void main() {
               ).captured.single
               as List<LocalAsset>;
       expect(uploaded.map((a) => a.id), [asset.id]);
+      verify(() => backgroundSync.syncRemote(enqueue: true)).called(1);
     });
 
     testWidgets('ignores assets that are already backed up', (tester) async {
@@ -154,6 +160,44 @@ void main() {
       await tester.pump();
 
       expect(find.text(StaticTranslations.instance.uploading), findsOneWidget);
+
+      uploading.complete();
+      await settleUpload(tester);
+
+      expect(find.text(StaticTranslations.instance.uploading), findsNothing);
+    });
+
+    testWidgets('closes the progress dialog even if the upload button unmounts before upload completes', (
+      tester,
+    ) async {
+      final asset = LocalAssetFactory.create();
+      final uploading = Completer<void>();
+      answerUploadWith(succeeded: {asset.id}, until: uploading);
+
+      final selection = ValueNotifier<Set<BaseAsset>>({asset});
+      addTearDown(selection.dispose);
+
+      await tester.pumpTestWidget(
+        context,
+        ValueListenableBuilder<Set<BaseAsset>>(
+          valueListenable: selection,
+          builder: (_, selected, _) => selected.isEmpty
+              ? const SizedBox.shrink()
+              : const ActionIconButton(action: UploadAction(source: .timeline, showProgress: true)),
+        ),
+        overrides: [
+          ...context.selected({asset}),
+          ...uploadOverrides(),
+        ],
+      );
+
+      await tester.tap(find.byType(ImmichIconButton));
+      await tester.pump();
+      expect(find.text(StaticTranslations.instance.uploading), findsOneWidget);
+
+      // Simulate the viewer promoting LocalAsset -> RemoteAsset so UploadAction unmounts.
+      selection.value = const {};
+      await tester.pump();
 
       uploading.complete();
       await settleUpload(tester);

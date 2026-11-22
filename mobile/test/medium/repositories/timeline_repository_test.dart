@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:immich_mobile/domain/models/asset/base_asset.model.dart';
 import 'package:immich_mobile/infrastructure/repositories/timeline.repository.dart';
@@ -239,6 +241,29 @@ void main() {
 
       expect(buckets, hasLength(1));
       expect(buckets.single.assetCount, 1);
+    });
+
+    test('re-emits buckets when a matching remote asset arrives so tile icons refresh', () async {
+      const checksum = 'uploaded-local-checksum';
+      final album = await ctx.newLocalAlbum();
+      final local = await ctx.newLocalAsset(checksum: checksum);
+      await ctx.newLocalAlbumAsset(albumId: album.id, assetId: local.id);
+
+      final query = sut.localAlbum(album.id, .day);
+      final updates = StreamIterator(query.bucketSource());
+      addTearDown(updates.cancel);
+
+      expect(await updates.moveNext(), isTrue);
+      final before = await query.assetSource(0, 10);
+      expect((before.single as LocalAsset).storage, AssetState.local);
+
+      final remote = await ctx.newRemoteAsset(ownerId: userId, checksum: checksum);
+
+      expect(await updates.moveNext(), isTrue);
+      final after = await query.assetSource(0, 10);
+      final updatedLocal = after.single as LocalAsset;
+      expect(updatedLocal.remoteId, remote.id);
+      expect(updatedLocal.storage, AssetState.merged);
     });
   });
 }

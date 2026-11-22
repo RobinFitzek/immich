@@ -6,6 +6,7 @@ import 'package:immich_mobile/constants/enums.dart';
 import 'package:immich_mobile/domain/models/asset/base_asset.model.dart';
 import 'package:immich_mobile/generated/translations.g.dart';
 import 'package:immich_mobile/presentation/actions/action.dart';
+import 'package:immich_mobile/providers/background_sync.provider.dart';
 import 'package:immich_mobile/providers/backup/asset_upload_progress.provider.dart';
 import 'package:immich_mobile/providers/infrastructure/toast.provider.dart';
 import 'package:immich_mobile/services/foreground_upload.service.dart';
@@ -40,6 +41,11 @@ class UploadAction extends AssetActionBuilder {
         return;
       }
 
+      // Capture the root navigator before awaiting: if the uploaded local asset promotes to a
+      // remote asset mid-upload, this button unmounts (context.mounted == false), so we must
+      // dismiss the dialog via the root navigator in `finally` to avoid stranding it open.
+      final navigator = Navigator.of(context, rootNavigator: true);
+
       // The dialog is not awaited: it stays up while the upload runs and is
       // dismissed below, unless the user cancelled it themselves first
       var isDialogOpen = true;
@@ -51,10 +57,12 @@ class UploadAction extends AssetActionBuilder {
         ).whenComplete(() => isDialogOpen = false),
       );
 
-      await uploadAssets(context, ref, assets);
-
-      if (isDialogOpen && context.mounted) {
-        Navigator.of(context, rootNavigator: true).pop();
+      try {
+        await uploadAssets(context, ref, assets);
+      } finally {
+        if (isDialogOpen && navigator.mounted) {
+          navigator.pop();
+        }
       }
     } catch (error, stack) {
       handleError(error, stack: stack, description: "Failed to upload the assets");
@@ -99,6 +107,9 @@ Future<void> uploadAssets(BuildContext context, WidgetRef ref, List<LocalAsset> 
   }
 
   final uploadedCount = uploaded.difference(failed).length;
+  if (uploadedCount > 0) {
+    unawaited(ref.read(backgroundSyncProvider).syncRemote(enqueue: true));
+  }
   if (!cancelToken.isCompleted && (uploadedCount != assets.length || failed.isNotEmpty)) {
     toastService.error(errorMessage);
   }

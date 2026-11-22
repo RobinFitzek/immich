@@ -1,9 +1,13 @@
+import 'dart:async';
+
 import 'package:async/async.dart';
-import 'package:drift/drift.dart';
+import 'package:drift/drift.dart' hide isNotNull, isNull;
 import 'package:flutter_test/flutter_test.dart';
+import 'package:immich_mobile/data/db/main/table/local/asset.drift.dart';
 import 'package:immich_mobile/data/db/main/table/remote/asset.drift.dart';
 import 'package:immich_mobile/domain/models/asset/base_asset.model.dart';
 import 'package:immich_mobile/infrastructure/repositories/remote_asset.repository.dart';
+import 'package:immich_mobile/utils/option.dart';
 
 import '../repository_context.dart';
 
@@ -48,6 +52,95 @@ void main() {
       final stack = await sut.getStackChildren(primaryAsset!);
 
       expect(stack.map((asset) => asset.id), [beforePrimary.id, afterPrimary.id]);
+    });
+  });
+
+  group('watchMergedAsset', () {
+    late String userId;
+
+    setUp(() async {
+      final user = await ctx.newUser();
+      userId = user.id;
+      await ctx.newAuthUser(id: userId);
+    });
+
+    test('promotes an initially unhashed local asset to remote once hashed and synced', () async {
+      const checksum = 'unhashed-promoted';
+      final local = await ctx.newLocalAsset(checksumOption: const Option.none());
+
+      final updates = StreamIterator(sut.watchMergedAsset(localId: local.id));
+      addTearDown(updates.cancel);
+
+      expect(await updates.moveNext(), isTrue);
+      expect(updates.current, isA<LocalAsset>());
+      expect(updates.current!.id, local.id);
+
+      await (ctx.db.update(
+        ctx.db.localAssetEntity,
+      )..where((l) => l.id.equals(local.id))).write(const LocalAssetEntityCompanion(checksum: Value(checksum)));
+      expect(await updates.moveNext(), isTrue);
+      expect(updates.current, isA<LocalAsset>());
+      expect(updates.current!.checksum, checksum);
+
+      final remote = await ctx.newRemoteAsset(ownerId: userId, checksum: checksum);
+      expect(await updates.moveNext(), isTrue);
+      expect(updates.current, isA<RemoteAsset>());
+      expect(updates.current!.id, remote.id);
+      expect(updates.current!.localId, local.id);
+    });
+
+    test('promotes a hashed local asset to remote and survives local deletion', () async {
+      const checksum = 'hashed-promoted';
+      final local = await ctx.newLocalAsset(checksum: checksum);
+
+      final updates = StreamIterator(sut.watchMergedAsset(localId: local.id, checksum: checksum));
+      addTearDown(updates.cancel);
+
+      expect(await updates.moveNext(), isTrue);
+      expect(updates.current, isA<LocalAsset>());
+
+      final remote = await ctx.newRemoteAsset(ownerId: userId, checksum: checksum);
+      expect(await updates.moveNext(), isTrue);
+      expect(updates.current, isA<RemoteAsset>());
+      expect(updates.current!.id, remote.id);
+      expect(updates.current!.localId, local.id);
+
+      await (ctx.db.delete(ctx.db.localAssetEntity)..where((l) => l.id.equals(local.id))).go();
+      expect(await updates.moveNext(), isTrue);
+      expect(updates.current, isA<RemoteAsset>());
+      expect(updates.current!.id, remote.id);
+      expect(updates.current!.localId, isNull);
+    });
+
+    test('falls back to local when the remote copy is deleted', () async {
+      const checksum = 'merged-demote';
+      final local = await ctx.newLocalAsset(checksum: checksum);
+      final remote = await ctx.newRemoteAsset(ownerId: userId, checksum: checksum);
+
+      final updates = StreamIterator(sut.watchMergedAsset(remoteId: remote.id, checksum: checksum));
+      addTearDown(updates.cancel);
+
+      expect(await updates.moveNext(), isTrue);
+      expect(updates.current, isA<RemoteAsset>());
+
+      await (ctx.db.delete(ctx.db.remoteAssetEntity)..where((r) => r.id.equals(remote.id))).go();
+
+      expect(await updates.moveNext(), isTrue);
+      expect(updates.current, isA<LocalAsset>());
+      expect(updates.current!.id, local.id);
+    });
+
+    test('does not promote a local asset to a partner-owned remote copy', () async {
+      const checksum = 'merged-partner';
+      final partner = await ctx.newUser();
+      final local = await ctx.newLocalAsset(checksum: checksum);
+      await ctx.newRemoteAsset(ownerId: partner.id, checksum: checksum);
+
+      final updates = StreamIterator(sut.watchMergedAsset(localId: local.id, checksum: checksum));
+      addTearDown(updates.cancel);
+
+      expect(await updates.moveNext(), isTrue);
+      expect(updates.current, isA<LocalAsset>());
     });
   });
 

@@ -1,5 +1,7 @@
+import 'dart:convert';
 import 'dart:io';
 
+import 'package:crypto/crypto.dart';
 import 'package:drift/drift.dart' hide isNotNull, isNull;
 import 'package:drift/native.dart';
 import 'package:flutter/services.dart';
@@ -56,6 +58,7 @@ void main() {
     mockAssetMediaRepository = MockAssetMediaRepository();
     mockAssetService = MockAssetService();
     when(() => mockAssetService.getLocalAsset(any())).thenAnswer((_) async => null);
+    when(() => mockAssetService.updateLocalChecksum(any(), any())).thenAnswer((_) async {});
     when(() => mockAssetService.stackEditedUpload(any(), any(), any())).thenAnswer((_) async {});
 
     sut = ForegroundUploadService(
@@ -257,6 +260,64 @@ void main() {
       expect(succeeded, equals(['remote']));
       verify(() => mockAssetService.stackEditedUpload(asset.localId!, 'remote', 'sha')).called(1);
       verifyZeroInteractions(mockStorageRepository);
+      verifyZeroInteractions(mockUploadRepository);
+    });
+
+    test('hashes an unhashed file before upload and persists the checksum locally', () async {
+      final tempDir = await Directory.systemTemp.createTemp('immich_upload_hash_test_');
+      addTearDown(() => tempDir.delete(recursive: true));
+      final realFile = File('${tempDir.path}/screenshot.jpg');
+      final bytes = utf8.encode('fake-screenshot-bytes');
+      await realFile.writeAsBytes(bytes);
+      final expectedChecksum = base64.encode(sha1.convert(bytes).bytes);
+
+      final asset = LocalAssetStub.image1;
+      final mockEntity = MockAssetEntity();
+
+      when(() => mockEntity.isLivePhoto).thenReturn(false);
+      when(() => mockStorageRepository.getAssetEntityForAsset(asset)).thenAnswer((_) async => mockEntity);
+      when(() => mockStorageRepository.isAssetAvailableLocally(asset.id)).thenAnswer((_) async => true);
+      when(() => mockStorageRepository.getFileForAsset(asset.id)).thenAnswer((_) async => realFile);
+      when(() => mockAssetMediaRepository.getOriginalFilename(asset.id)).thenAnswer((_) async => 'screenshot.jpg');
+      captureFields();
+
+      await sut.uploadSingleAsset(asset, null, callbacks: const UploadCallbacks());
+
+      verify(() => mockAssetService.updateLocalChecksum(asset.id, expectedChecksum)).called(1);
+      verify(() => mockAssetService.stackEditedUpload(asset.localId!, 'remote-1', expectedChecksum)).called(1);
+    });
+
+    test('skips uploading when hashing reveals the asset already exists on the server', () async {
+      final tempDir = await Directory.systemTemp.createTemp('immich_upload_dedup_test_');
+      addTearDown(() => tempDir.delete(recursive: true));
+      final realFile = File('${tempDir.path}/screenshot.jpg');
+      final bytes = utf8.encode('already-on-server');
+      await realFile.writeAsBytes(bytes);
+      final expectedChecksum = base64.encode(sha1.convert(bytes).bytes);
+
+      final asset = LocalAssetStub.image1;
+      final mockEntity = MockAssetEntity();
+      final succeeded = <String>[];
+      var lookupCount = 0;
+
+      when(() => mockAssetService.getLocalAsset(asset.id)).thenAnswer((_) async {
+        lookupCount++;
+        return lookupCount == 1 ? null : asset.copyWith(checksum: expectedChecksum, remoteId: 'existing-remote');
+      });
+      when(() => mockEntity.isLivePhoto).thenReturn(false);
+      when(() => mockStorageRepository.getAssetEntityForAsset(asset)).thenAnswer((_) async => mockEntity);
+      when(() => mockStorageRepository.isAssetAvailableLocally(asset.id)).thenAnswer((_) async => true);
+      when(() => mockStorageRepository.getFileForAsset(asset.id)).thenAnswer((_) async => realFile);
+
+      await sut.uploadSingleAsset(
+        asset,
+        null,
+        callbacks: UploadCallbacks(onSuccess: (_, remoteId) => succeeded.add(remoteId)),
+      );
+
+      expect(succeeded, equals(['existing-remote']));
+      verify(() => mockAssetService.updateLocalChecksum(asset.id, expectedChecksum)).called(1);
+      verify(() => mockAssetService.stackEditedUpload(asset.localId!, 'existing-remote', expectedChecksum)).called(1);
       verifyZeroInteractions(mockUploadRepository);
     });
   });
